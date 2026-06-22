@@ -47,17 +47,28 @@ cmake --build build --config Release -j4
 # Скачивание модели (~1.2 ГБ)
 mkdir -p models && cd models
 wget https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
+```
 
-2. Запуск LLM-сервера
-bash~/llama.cpp/build/bin/llama-server \
+
+### 2. Запуск LLM-сервера
+```bash
+
+~/llama.cpp/build/bin/llama-server \
   -m ~/llama.cpp/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
   --host 127.0.0.1 --port 8080 -c 2048 -ngl 0
+```
 Проверка:
-bashcurl -s http://127.0.0.1:8080/health
+```bash
+curl -s http://127.0.0.1:8080/health
+```
 Должен ответить {"status":"ok"}.
-3. Установка плагина в Obsidian
+
+### 4. Установка плагина в Obsidian
+
 Вариант A — из скомпилированного релиза
-bash# На компьютере
+```bash
+
+# На компьютере
 git clone https://github.com/redokov/obsidian-voice-format.git
 cd obsidian-voice-format
 npm install
@@ -77,7 +88,9 @@ git clone https://github.com/redokov/obsidian-voice-format.git voice-format
 cd voice-format
 npm install
 npm run build
-4. Активация в Obsidian
+```
+
+### 4. Активация в Obsidian
 
 Obsidian → Настройки → Сторонние плагины → Включить сторонние плагины
 Перезагрузить Obsidian
@@ -101,7 +114,10 @@ Obsidian → Настройки → Сторонние плагины → Вкл
 ПараметрПо умолчаниюОписаниеАдрес сервераhttp://127.0.0.1:8080URL llama.cpp сервераЗадержка автоформата3000 мсПауза перед автоформатированиемТемпература0.1Креативность модели (ниже = точнее)Системный промпт(встроенный)Инструкция для LLM
 SSH-доступ с компьютера (рекомендуется)
 Для удобной разработки и управления:
-bash# В Termux на телефоне (один раз)
+
+```bash
+
+# В Termux на телефоне (один раз)
 pkg install -y openssh
 passwd  # задайте пароль
 sshd    # запуск SSH-сервера (порт 8022)
@@ -127,6 +143,7 @@ ssh phone "pgrep -a llama-server"
 ssh phone "~/llama.cpp/build/bin/llama-server \
   -m ~/llama.cpp/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
   --host 127.0.0.1 --port 8080 -c 2048 -ngl 0 &"
+```
 Плагин не появляется в Obsidian
 
 Убедитесь, что main.js и manifest.json лежат в .obsidian/plugins/voice-format/
