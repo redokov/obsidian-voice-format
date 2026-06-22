@@ -1,20 +1,19 @@
-import { Plugin, Notice, MarkdownView, Editor } from 'obsidian';
+import { Plugin, Notice, MarkdownView, Editor, PluginSettingTab, App, Setting } from 'obsidian';
 
 interface VoiceFormatSettings {
   serverUrl: string;
   debounceMs: number;
   systemPrompt: string;
+  maxTokens: number;
+  temperature: number;
 }
 
 const DEFAULT_SETTINGS: VoiceFormatSettings = {
   serverUrl: 'http://127.0.0.1:8080',
-  debounceMs: 3000,  // ждём 3 сек паузы перед форматированием
-  systemPrompt: `Ты — корректор диктовки. Исправь текст:
-- Расставь точки, запятые, вопросительные и восклицательные знаки
-- Расставь заглавные буквы после точек и в начале текста
-- Раздели на абзацы по смыслу (пустая строка между абзацами)
-- НЕ меняй слова, НЕ добавляй и НЕ удаляй слова
-- Верни ТОЛЬКО исправленный текст, без комментариев`
+  debounceMs: 3000,
+  systemPrompt: 'Расставь знаки препинания, заглавные буквы. Сохрани разбивку на абзацы. НЕ меняй слова. Верни ТОЛЬКО исправленный текст.',
+  maxTokens: 2048,
+  temperature: 0.1
 };
 
 export default class VoiceFormatPlugin extends Plugin {
@@ -22,14 +21,152 @@ export default class VoiceFormatPlugin extends Plugin {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastProcessedLength = 0;
   private isProcessing = false;
-    // ── Предобработка голосовых команд ───────────────
+  private autoFormatEnabled = false;
+  private readonly MARKER = '<!-- voice-formatted -->';
+  private statusBarEl: HTMLElement | null = null;
+
+    async onload() {
+    await this.loadSettings();
+    this.addSettingTab(new VoiceFormatSettingTab(this.app, this));
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.updateStatusBar();
+
+    this.addCommand({
+      id: 'format-dictation',
+      name: 'Форматировать диктовку',
+      editorCallback: (editor: Editor) => {
+        this.formatText(editor, false);
+      }
+    });
+
+    this.addCommand({
+      id: 'toggle-auto-format',
+      name: 'Автоформат вкл/выкл',
+      callback: () => {
+        this.toggleAutoFormat();
+      }
+    });
+
+    this.addCommand({
+      id: 'check-server',
+      name: 'Проверить LLM-сервер',
+      callback: () => {
+        this.checkServer();
+      }
+    });
+
+    this.addRibbonIcon('mic', 'Форматировать диктовку', () => {
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (view) {
+        this.formatText(view.editor, false);
+      } else {
+        new Notice('Откройте заметку');
+      }
+    });
+
+    // Проверка сервера при запуске плагина
+    this.checkServerOnStartup();
+  }
+
+  private async checkServerOnStartup() {
+    try {
+      const response = await fetch(this.settings.serverUrl + '/health', {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (response.ok) {
+        this.updateStatusBarText('✅ LLM');
+      } else {
+        this.updateStatusBarText('⚠️ LLM');
+        new Notice('⚠️ LLM-сервер ответил с ошибкой. Проверьте Termux.');
+      }
+    } catch (e) {
+      this.updateStatusBarText('❌ LLM');
+      new Notice('❌ LLM-сервер недоступен. Запустите ~/start-llm.sh в Termux');
+    }
+  }
+
+  private updateStatusBarText(text: string) {
+    if (this.statusBarEl) {
+      this.statusBarEl.setText(text);
+    }
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+
+  private updateStatusBar() {
+    if (!this.statusBarEl) return;
+    if (this.isProcessing) {
+      this.statusBarEl.setText('⏳ Форматирование...');
+    } else if (this.autoFormatEnabled) {
+      this.statusBarEl.setText('🎙 Автоформат');
+    }
+    // Не очищаем — оставляем статус сервера
+  }
+
+
+  toggleAutoFormat() {
+    this.autoFormatEnabled = !this.autoFormatEnabled;
+    if (this.autoFormatEnabled) {
+      new Notice('🎙 Автоформат включён');
+      this.startWatching();
+    } else {
+      new Notice('⏹ Автоформат выключен');
+      this.stopWatching();
+    }
+    this.updateStatusBar();
+  }
+
+  private startWatching() {
+    this.registerEvent(
+      this.app.workspace.on('editor-change', (editor: Editor) => {
+        if (!this.autoFormatEnabled || this.isProcessing) return;
+        this.debouncedFormat(editor);
+      })
+    );
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (view) {
+      this.lastProcessedLength = view.editor.getValue().length;
+    }
+  }
+
+  private stopWatching() {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+  }
+
+  private debouncedFormat(editor: Editor) {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.formatNewText(editor);
+    }, this.settings.debounceMs);
+  }
+
+  private async formatNewText(editor: Editor) {
+    const fullText = editor.getValue();
+    if (fullText.length <= this.lastProcessedLength) return;
+    const newText = fullText.substring(this.lastProcessedLength).trim();
+    if (newText.length < 10) return;
+    await this.formatText(editor, true);
+  }
+
+  // ── Предобработка голосовых команд ───────────────
 
   private preprocessVoiceCommands(text: string): string {
     const commands: [RegExp, string][] = [
-      [/\s*новый абзац\s*/gi,    '\n\n'],
-      [/\s*новая строка\s*/gi,   '\n\n'],
+      [/\s*новый абзац\s*/gi,     '\n\n'],
+      [/\s*новая строка\s*/gi,    '\n\n'],
       [/\s*следующая строка\s*/gi, '\n\n'],
-      // Знаки в конце предложения — убираем точку перед ними если есть
       [/[.\s]*восклицательный знак\s*/gi, '! '],
       [/[.\s]*вопросительный знак\s*/gi,  '? '],
       [/[.\s]*точка\s*/gi,       '. '],
@@ -48,114 +185,18 @@ export default class VoiceFormatPlugin extends Plugin {
       result = result.replace(pattern, replacement);
     }
 
-    // Убрать двойные пробелы
     result = result.replace(/ {2,}/g, ' ');
-    // Убрать пробел перед знаком препинания
     result = result.replace(/ ([.!?,;:])/g, '$1');
 
     return result.trim();
   }
 
-  // Маркер: текст до этой строки уже отформатирован
-  private readonly MARKER = '<!-- voice-formatted -->';
-
-  async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS);
-
-    // Команда: форматировать выделенный текст или весь документ
-    this.addCommand({
-      id: 'format-dictation',
-      name: 'Форматировать диктовку',
-      editorCallback: (editor: Editor) => {
-        this.formatText(editor, false);
-      }
-    });
-
-    // Команда: включить/выключить автоформат
-    this.addCommand({
-      id: 'toggle-auto-format',
-      name: 'Автоформат вкл/выкл',
-      callback: () => {
-        this.toggleAutoFormat();
-      }
-    });
-
-    // Иконка в боковой панели
-    this.addRibbonIcon('mic', 'Voice Format', () => {
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (view) {
-        this.formatText(view.editor, false);
-      }
-    });
-  }
-
-  // ── Автоформат по паузе ──────────────────────────
-
-  private autoFormatEnabled = false;
-  private editorChangeRef: (() => void) | null = null;
-
-  toggleAutoFormat() {
-    this.autoFormatEnabled = !this.autoFormatEnabled;
-
-    if (this.autoFormatEnabled) {
-      new Notice('🎙 Автоформат включён');
-      this.startWatching();
-    } else {
-      new Notice('⏹ Автоформат выключен');
-      this.stopWatching();
-    }
-  }
-
-  private startWatching() {
-    // Слушаем изменения в редакторе
-    this.registerEvent(
-      this.app.workspace.on('editor-change', (editor: Editor) => {
-        if (!this.autoFormatEnabled || this.isProcessing) return;
-        this.debouncedFormat(editor);
-      })
-    );
-
-    // Запоминаем текущую длину как "уже обработанное"
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (view) {
-      this.lastProcessedLength = view.editor.getValue().length;
-    }
-  }
-
-  private stopWatching() {
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-      this.debounceTimer = null;
-    }
-  }
-
-  private debouncedFormat(editor: Editor) {
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-    }
-
-    this.debounceTimer = setTimeout(() => {
-      this.formatNewText(editor);
-    }, this.settings.debounceMs);
-  }
-
   // ── Форматирование ──────────────────────────────
 
-  // Форматировать только новый текст (для автоформата)
-  private async formatNewText(editor: Editor) {
-    const fullText = editor.getValue();
-    if (fullText.length <= this.lastProcessedLength) return;
-
-    const newText = fullText.substring(this.lastProcessedLength).trim();
-    if (newText.length < 10) return; // слишком мало текста
-
-    await this.formatText(editor, true);
-  }
-
-  // Основная функция форматирования
   private async formatText(editor: Editor, autoMode: boolean) {
     if (this.isProcessing) return;
     this.isProcessing = true;
+    this.updateStatusBar();
 
     try {
       let textToFormat: string;
@@ -165,12 +206,10 @@ export default class VoiceFormatPlugin extends Plugin {
       const selection = editor.getSelection();
 
       if (selection && !autoMode) {
-        // Ручной режим: форматируем выделенное
         textToFormat = selection;
         replaceStart = editor.getCursor('from');
         replaceEnd = editor.getCursor('to');
       } else if (autoMode) {
-        // Автоформат: берём текст после последнего маркера
         const fullText = editor.getValue();
         const markerPos = fullText.lastIndexOf(this.MARKER);
         const startIdx = markerPos >= 0
@@ -180,10 +219,10 @@ export default class VoiceFormatPlugin extends Plugin {
 
         if (textToFormat.length < 10) {
           this.isProcessing = false;
+          this.updateStatusBar();
           return;
         }
 
-        // Вычисляем позиции для замены
         const lines = fullText.substring(0, startIdx).split('\n');
         replaceStart = {
           line: lines.length - 1,
@@ -194,7 +233,6 @@ export default class VoiceFormatPlugin extends Plugin {
           ch: editor.getLine(editor.lineCount() - 1).length
         };
       } else {
-        // Ручной режим без выделения: весь документ
         textToFormat = editor.getValue();
         replaceStart = { line: 0, ch: 0 };
         replaceEnd = {
@@ -205,18 +243,12 @@ export default class VoiceFormatPlugin extends Plugin {
 
       if (!textToFormat.trim()) {
         this.isProcessing = false;
+        this.updateStatusBar();
         return;
       }
 
-      new Notice('⏳ Форматирование...');
-
-      // Было:
-      // const formatted = await this.callLLM(textToFormat);
-
-      // Стало:
       const preprocessed = this.preprocessVoiceCommands(textToFormat);
       const formatted = await this.callLLM(preprocessed);
-
 
       if (formatted) {
         const replacement = autoMode
@@ -225,28 +257,27 @@ export default class VoiceFormatPlugin extends Plugin {
 
         editor.replaceRange(replacement, replaceStart, replaceEnd);
         this.lastProcessedLength = editor.getValue().length;
-
         new Notice('✅ Отформатировано');
       }
     } catch (e) {
-      new Notice('❌ Ошибка: ' + (e as Error).message);
+      new Notice('❌ ' + (e as Error).message);
     }
 
     this.isProcessing = false;
+    this.updateStatusBar();
   }
 
-  // ── Вызов LLM ────────────────────────────────────
+  // ── LLM ──────────────────────────────────────────
 
   private async callLLM(text: string): Promise<string | null> {
     const url = this.settings.serverUrl + '/v1/chat/completions';
-
     const body = {
       messages: [
         { role: 'system', content: this.settings.systemPrompt },
         { role: 'user', content: text }
       ],
-      temperature: 0.1,
-      max_tokens: Math.max(text.length * 2, 500)
+      temperature: this.settings.temperature,
+      max_tokens: this.settings.maxTokens
     };
 
     const response = await fetch(url, {
@@ -257,16 +288,111 @@ export default class VoiceFormatPlugin extends Plugin {
     });
 
     if (!response.ok) {
-      throw new Error(`Server error: ${response.status}`);
+      throw new Error(`Сервер: ${response.status} ${response.statusText}`);
     }
 
     const data = await response.json();
-    const result = data.choices?.[0]?.message?.content?.trim();
+    return data.choices?.[0]?.message?.content?.trim() || null;
+  }
 
-    return result || null;
+  private async checkServer() {
+    try {
+      new Notice('⏳ Проверка сервера...');
+      const response = await fetch(this.settings.serverUrl + '/health', {
+        signal: AbortSignal.timeout(5000)
+      });
+      if (response.ok) {
+        new Notice('✅ Сервер доступен');
+      } else {
+        new Notice('⚠️ Сервер ответил: ' + response.status);
+      }
+    } catch (e) {
+      new Notice('❌ Сервер недоступен. Запущен ли llama-server?');
+    }
   }
 
   onunload() {
     this.stopWatching();
+  }
+}
+
+// ── Страница настроек ──────────────────────────────
+
+class VoiceFormatSettingTab extends PluginSettingTab {
+  plugin: VoiceFormatPlugin;
+
+  constructor(app: App, plugin: VoiceFormatPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: 'Voice Format — настройки' });
+
+    new Setting(containerEl)
+      .setName('Адрес LLM-сервера')
+      .setDesc('URL llama.cpp сервера')
+      .addText(text => text
+        .setPlaceholder('http://127.0.0.1:8080')
+        .setValue(this.plugin.settings.serverUrl)
+        .onChange(async (value) => {
+          this.plugin.settings.serverUrl = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Задержка автоформата (мс)')
+      .setDesc('Пауза перед автоформатированием (минимум 500)')
+      .addText(text => text
+        .setValue(String(this.plugin.settings.debounceMs))
+        .onChange(async (value) => {
+          const num = parseInt(value);
+          if (!isNaN(num) && num >= 500) {
+            this.plugin.settings.debounceMs = num;
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('Температура')
+      .setDesc('0.0–1.0. Ниже — точнее')
+      .addText(text => text
+        .setValue(String(this.plugin.settings.temperature))
+        .onChange(async (value) => {
+          const num = parseFloat(value);
+          if (!isNaN(num) && num >= 0 && num <= 1) {
+            this.plugin.settings.temperature = num;
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('Макс. токенов ответа')
+      .setDesc('Максимальная длина ответа LLM')
+      .addText(text => text
+        .setValue(String(this.plugin.settings.maxTokens))
+        .onChange(async (value) => {
+          const num = parseInt(value);
+          if (!isNaN(num) && num >= 100) {
+            this.plugin.settings.maxTokens = num;
+            await this.plugin.saveSettings();
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('Системный промпт')
+      .setDesc('Инструкция для LLM')
+      .addTextArea(text => {
+        text
+          .setValue(this.plugin.settings.systemPrompt)
+          .onChange(async (value) => {
+            this.plugin.settings.systemPrompt = value;
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.rows = 8;
+        text.inputEl.cols = 50;
+      });
   }
 }
