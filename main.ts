@@ -22,6 +22,40 @@ export default class VoiceFormatPlugin extends Plugin {
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private lastProcessedLength = 0;
   private isProcessing = false;
+    // ── Предобработка голосовых команд ───────────────
+
+  private preprocessVoiceCommands(text: string): string {
+    const commands: [RegExp, string][] = [
+      [/\s*новый абзац\s*/gi,    '\n\n'],
+      [/\s*новая строка\s*/gi,   '\n\n'],
+      [/\s*следующая строка\s*/gi, '\n\n'],
+      // Знаки в конце предложения — убираем точку перед ними если есть
+      [/[.\s]*восклицательный знак\s*/gi, '! '],
+      [/[.\s]*вопросительный знак\s*/gi,  '? '],
+      [/[.\s]*точка\s*/gi,       '. '],
+      [/\s*запятая\s*/gi,        ', '],
+      [/\s*двоеточие\s*/gi,      ': '],
+      [/\s*тире\s*/gi,           ' — '],
+      [/\s*дефис\s*/gi,          '-'],
+      [/\s*открыть скобку\s*/gi, ' ('],
+      [/\s*закрыть скобку\s*/gi, ') '],
+      [/\s*кавычки\s*/gi,        '"'],
+      [/\s*многоточие\s*/gi,     '... '],
+    ];
+
+    let result = text;
+    for (const [pattern, replacement] of commands) {
+      result = result.replace(pattern, replacement);
+    }
+
+    // Убрать двойные пробелы
+    result = result.replace(/ {2,}/g, ' ');
+    // Убрать пробел перед знаком препинания
+    result = result.replace(/ ([.!?,;:])/g, '$1');
+
+    return result.trim();
+  }
+
   // Маркер: текст до этой строки уже отформатирован
   private readonly MARKER = '<!-- voice-formatted -->';
 
@@ -176,7 +210,13 @@ export default class VoiceFormatPlugin extends Plugin {
 
       new Notice('⏳ Форматирование...');
 
-      const formatted = await this.callLLM(textToFormat);
+      // Было:
+      // const formatted = await this.callLLM(textToFormat);
+
+      // Стало:
+      const preprocessed = this.preprocessVoiceCommands(textToFormat);
+      const formatted = await this.callLLM(preprocessed);
+
 
       if (formatted) {
         const replacement = autoMode
